@@ -46,11 +46,6 @@ export const Fader: React.FC<FaderProps> = ({
 
   const visualPos = dbToPosition(valueDb); // 0 (bottom) to 1 (top)
 
-  const handlePointerDown = (e: React.MouseEvent) => {
-    setIsDragging(true);
-    updateFromPointer(e.clientY);
-  };
-
   const updateFromPointer = useCallback(
     (clientY: number) => {
       if (!trackRef.current) return;
@@ -64,25 +59,37 @@ export const Fader: React.FC<FaderProps> = ({
     [minDb, maxDb, onChange]
   );
 
-  useEffect(() => {
-    const handleMove = (e: MouseEvent) => {
-      if (!isDragging) return;
-      updateFromPointer(e.clientY);
-    };
-    const handleUp = () => setIsDragging(false);
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {}
+    setIsDragging(true);
+    updateFromPointer(e.clientY);
+  };
 
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isDragging) return;
+    e.preventDefault();
+    e.stopPropagation();
+    updateFromPointer(e.clientY);
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (isDragging) {
-      window.addEventListener('mousemove', handleMove);
-      window.addEventListener('mouseup', handleUp);
+      try {
+        (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+      } catch {}
+      setIsDragging(false);
     }
-    return () => {
-      window.removeEventListener('mousemove', handleMove);
-      window.removeEventListener('mouseup', handleUp);
-    };
-  }, [isDragging, updateFromPointer]);
+  };
 
   return (
-    <div className="flex flex-col items-center select-none w-14">
+    <div
+      className="flex flex-col items-center select-none w-14 touch-none"
+      style={{ touchAction: 'none' }}
+    >
       {/* dB Value readout */}
       <span className="text-[11px] font-mono text-zinc-200 font-semibold mb-1">
         {valueDb <= minDb ? '-inf' : valueDb > 0 ? `+${valueDb.toFixed(1)}` : `${valueDb.toFixed(1)}`}
@@ -105,11 +112,14 @@ export const Fader: React.FC<FaderProps> = ({
         {/* Track Slot */}
         <div
           ref={trackRef}
-          onMouseDown={handlePointerDown}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
           onDoubleClick={() => onChange(0)} // Reset to 0dB unity
-          className="relative w-3.5 bg-[#0f121a] rounded-full border border-white/10 cursor-pointer shadow-inner flex items-center justify-center"
-          style={{ height }}
-          title="Drag fader to adjust gain (double click for 0dB)"
+          className="relative w-3.5 bg-[#0f121a] rounded-full border border-white/10 cursor-pointer shadow-inner flex items-center justify-center touch-none"
+          style={{ height, touchAction: 'none' }}
+          title="Drag fader to adjust gain (double click for 0dB unity)"
         >
           {/* Unity 0dB mark line */}
           <div

@@ -17,9 +17,11 @@ import {
   Headphones,
   Mic,
   Zap,
+  Layers,
 } from 'lucide-react';
 import { WaveformDisplay } from './WaveformDisplay';
 import { SpectrumAnalyzer } from './SpectrumAnalyzer';
+import { ExportModal } from './ExportModal';
 import {
   masterEngine,
   MasteringDspState,
@@ -36,9 +38,13 @@ import { generateDemoAudio } from '../audio/demo-audio';
 
 interface EasyMasteringViewProps {
   onSwitchToPro: () => void;
+  onSwitchToMultitrack?: () => void;
 }
 
-export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchToPro }) => {
+export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({
+  onSwitchToPro,
+  onSwitchToMultitrack,
+}) => {
   const [buffer, setBuffer] = useState<AudioBuffer | null>(null);
   const [fileName, setFileName] = useState<string>('No track loaded');
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -51,29 +57,34 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
   const [isMasterApplied, setIsMasterApplied] = useState<boolean>(false);
   const [isBypassed, setIsBypassed] = useState<boolean>(false); // A/B Audition (true = Original, false = Mastered)
 
-  // Export settings
-  const [isExporting, setIsExporting] = useState<boolean>(false);
-  const [bitDepth, setBitDepth] = useState<BitDepth>(24);
-  const [normalize, setNormalize] = useState<boolean>(true);
+  // Export Modal
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
   // Load initial demo buffer so the user has immediate audio to test with
   useEffect(() => {
-    masterEngine.initAudioContext().then((ctx) => {
-      const demo = generateDemoAudio(ctx);
-      setBuffer(demo.fullMaster);
-      setFileName('AudioForge_Demo_Song_Am_Groove.wav');
-      setDuration(demo.fullMaster.duration);
-      masterEngine.loadAudioBuffer(demo.fullMaster);
-
-      // Run initial analysis
-      const analysis = analyzeAudioBufferForMastering(demo.fullMaster, selectedProfile);
+    const existing = masterEngine.getAudioBuffer();
+    if (existing) {
+      setBuffer(existing);
+      setDuration(existing.duration);
+      setFileName('Loaded Song');
+      const analysis = analyzeAudioBufferForMastering(existing, selectedProfile);
       setAnalysisResult(analysis);
+    } else {
+      masterEngine.initAudioContext().then((ctx) => {
+        const demo = generateDemoAudio(ctx);
+        setBuffer(demo.fullMaster);
+        setFileName('AudioForge_Demo_Song_Am_Groove.wav');
+        setDuration(demo.fullMaster.duration);
+        masterEngine.loadAudioBuffer(demo.fullMaster);
 
-      // Apply initial automated DSP master
-      const dsp = generateAutomatedDspState(analysis, selectedProfile);
-      masterEngine.updateState(dsp);
-      setIsMasterApplied(true);
-    });
+        const analysis = analyzeAudioBufferForMastering(demo.fullMaster, selectedProfile);
+        setAnalysisResult(analysis);
+
+        const dsp = generateAutomatedDspState(analysis, selectedProfile);
+        masterEngine.updateState(dsp);
+        setIsMasterApplied(true);
+      });
+    }
   }, []);
 
   // Update playback time ticker
@@ -85,7 +96,6 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
     return () => clearInterval(interval);
   }, []);
 
-  // When profile changes, re-analyze and re-apply if applied
   const handleSelectProfile = (id: MasteringProfileId) => {
     setSelectedProfile(id);
     if (buffer) {
@@ -158,32 +168,27 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
     setIsBypassed(false);
   };
 
-  // Real Audio Export
-  const handleExport = async () => {
-    if (!buffer) return;
-    setIsExporting(true);
+  // Render callback for ExportModal
+  const handleRenderCallback = async (options: {
+    filename: string;
+    bitDepth: BitDepth;
+    sampleRate: number;
+    normalize: boolean;
+  }) => {
+    if (!buffer) throw new Error('No audio loaded to export');
+    const dspState = masterEngine.getState();
+    const renderedBuffer = await masterEngine.renderMasterOffline(buffer, {
+      ...dspState,
+      bypass: false,
+    });
 
-    try {
-      const dspState = masterEngine.getState();
-      const renderedBuffer = await masterEngine.renderMasterOffline(buffer, {
-        ...dspState,
-        bypass: false,
-      });
+    const wavBlob = encodeWAV(renderedBuffer, {
+      bitDepth: options.bitDepth,
+      normalize: options.normalize,
+      sampleRate: options.sampleRate,
+    });
 
-      const wavBlob = encodeWAV(renderedBuffer, {
-        bitDepth,
-        normalize,
-        sampleRate: renderedBuffer.sampleRate,
-      });
-
-      const cleanName = fileName.replace(/\.[^/.]+$/, '');
-      const exportName = `${cleanName}_Mastered_${selectedProfile.toUpperCase()}_${bitDepth}bit.wav`;
-      downloadBlob(wavBlob, exportName);
-    } catch (err) {
-      console.error('Master export error:', err);
-    } finally {
-      setIsExporting(false);
-    }
+    return { blob: wavBlob, renderedBuffer };
   };
 
   const getProfileIcon = (id: MasteringProfileId) => {
@@ -210,7 +215,10 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center">
-              <Disc3 className="w-6 h-6 text-amber-400 animate-spin" style={{ animationDuration: isPlaying ? '3s' : '0s' }} />
+              <Disc3
+                className="w-6 h-6 text-amber-400 animate-spin"
+                style={{ animationDuration: isPlaying ? '3s' : '0s' }}
+              />
             </div>
             <div>
               <div className="flex items-center gap-2">
@@ -240,12 +248,23 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
               />
             </label>
 
+            {onSwitchToMultitrack && (
+              <button
+                onClick={onSwitchToMultitrack}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-sky-500/10 hover:bg-sky-500/20 border border-sky-500/30 text-xs font-semibold text-sky-300 transition-all cursor-pointer"
+                title="Work with multiple stems or instrument tracks"
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>Multi-Track Stems</span>
+              </button>
+            )}
+
             <button
               onClick={handleLoadDemo}
-              className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-xs font-semibold text-amber-300 transition-all"
+              className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-xs font-semibold text-amber-300 transition-all cursor-pointer"
             >
               <Music className="w-4 h-4" />
-              <span>Reload Demo Song</span>
+              <span>Reload Demo</span>
             </button>
           </div>
         </div>
@@ -289,7 +308,7 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
               </span>
               <button
                 onClick={handleToggleBypass}
-                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
                   !isBypassed
                     ? 'bg-amber-500 text-black shadow-md shadow-amber-500/20'
                     : 'bg-white/5 text-zinc-400 hover:text-white'
@@ -300,7 +319,7 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
               </button>
               <button
                 onClick={handleToggleBypass}
-                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
                   isBypassed
                     ? 'bg-slate-300 text-black shadow-md shadow-white/20'
                     : 'bg-white/5 text-zinc-400 hover:text-white'
@@ -316,15 +335,13 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
 
       {/* Target Mastering Profile Selector */}
       <div className="space-y-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-sm font-bold uppercase tracking-wider text-white">
-              Step 1: Choose Target Commercial Profile
-            </h3>
-            <p className="text-xs text-zinc-400">
-              AudioForge AI analyzes your mix and tailors EQ curves, dynamic glue, and loudness to standard delivery targets.
-            </p>
-          </div>
+        <div>
+          <h3 className="text-sm font-bold uppercase tracking-wider text-white">
+            Step 1: Choose Target Commercial Profile
+          </h3>
+          <p className="text-xs text-zinc-400">
+            AudioForge AI analyzes your mix and tailors EQ curves, dynamic glue, and loudness to standard delivery targets.
+          </p>
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -439,7 +456,7 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
 
             <button
               onClick={onSwitchToPro}
-              className="w-full flex items-center justify-center gap-2 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-300 text-xs font-semibold transition-all border border-white/10"
+              className="w-full flex items-center justify-center gap-2 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-300 text-xs font-semibold transition-all border border-white/10 cursor-pointer"
             >
               <SlidersHorizontal className="w-3.5 h-3.5 text-amber-400" />
               <span>Fine-Tune in Pro Mode (5-Band EQ & Limiter)</span>
@@ -457,50 +474,36 @@ export const EasyMasteringView: React.FC<EasyMasteringViewProps> = ({ onSwitchTo
             Step 3: Export Mastered Audio (Real 32-bit Float WAV)
           </h3>
           <p className="text-xs text-zinc-400">
-            Offline DSP render pipeline produces bit-accurate, commercial standard WAV files ready for Spotify, Apple Music, and CD.
+            Choose custom filenames, bit depth, and sample rate. Audio is rendered with exact EQ, dynamic compression, and ceiling limits baked in.
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
-          {/* Bit Depth Select */}
-          <div className="flex items-center bg-black/40 rounded-xl p-1 border border-white/10 text-xs">
-            {([16, 24, 32] as BitDepth[]).map((depth) => (
-              <button
-                key={depth}
-                onClick={() => setBitDepth(depth)}
-                className={`px-3 py-1.5 rounded-lg font-mono font-bold transition-all ${
-                  bitDepth === depth
-                    ? 'bg-amber-500 text-black'
-                    : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                {depth}-BIT
-              </button>
-            ))}
-          </div>
-
-          {/* Normalize Checkbox */}
-          <label className="flex items-center gap-2 text-xs font-medium text-zinc-300 cursor-pointer bg-black/40 px-3 py-2 rounded-xl border border-white/10">
-            <input
-              type="checkbox"
-              checked={normalize}
-              onChange={(e) => setNormalize(e.target.checked)}
-              className="accent-amber-500 rounded"
-            />
-            <span>True Peak Guard (-0.1 dB)</span>
-          </label>
-
-          {/* Export Button */}
-          <button
-            onClick={handleExport}
-            disabled={isExporting || !buffer}
-            className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black font-extrabold text-xs shadow-lg shadow-emerald-500/20 transition-all cursor-pointer disabled:opacity-50"
-          >
-            <Download className="w-4 h-4" />
-            <span>{isExporting ? 'RENDERING MASTER...' : 'EXPORT MASTERED WAV'}</span>
-          </button>
-        </div>
+        <button
+          onClick={() => setIsExportModalOpen(true)}
+          disabled={!buffer}
+          className="flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black font-extrabold text-xs shadow-lg shadow-emerald-500/20 transition-all cursor-pointer disabled:opacity-50"
+        >
+          <Download className="w-4 h-4" />
+          <span>CONFIGURE & EXPORT MASTER WAV</span>
+        </button>
       </div>
+
+      {/* Custom Filename Export Dialog */}
+      <ExportModal
+        isOpen={isExportModalOpen}
+        onClose={() => setIsExportModalOpen(false)}
+        defaultFilename={`${fileName.replace(/\.[^/.]+$/, '')}_Mastered_${selectedProfile.toUpperCase()}`}
+        modalTitle="Export Mastered Track (WAV)"
+        onRender={handleRenderCallback}
+        onLoadExportedAudio={(newBuf, newName) => {
+          setBuffer(newBuf);
+          setFileName(newName);
+          setDuration(newBuf.duration);
+          masterEngine.loadAudioBuffer(newBuf);
+          const analysis = analyzeAudioBufferForMastering(newBuf, selectedProfile);
+          setAnalysisResult(analysis);
+        }}
+      />
     </div>
   );
 };

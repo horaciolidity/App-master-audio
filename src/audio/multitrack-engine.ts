@@ -1,7 +1,8 @@
 /**
  * AUDIOFORGE Multitrack Mixing Engine
- * Provides sample-accurate track synchronization, per-channel strips,
- * 3-band EQ, pan laws, FX sends, and offline mixdown rendering.
+ * Provides sample-accurate track synchronization, multi-file import,
+ * independent channel strips (volume, pan, mute, solo, 3-band EQ, sends),
+ * and master bus processing (Master EQ, Compressor, Limiter) for real offline mixdowns.
  */
 
 export interface TrackData {
@@ -21,13 +22,15 @@ export interface TrackData {
   waveformData?: number[]; // Cached downsampled peak data for canvas
 }
 
-export interface ProjectState {
-  id: string;
-  name: string;
-  bpm: number;
-  sampleRate: number;
-  tracks: TrackData[];
-  masterVolumeDb: number;
+export interface MasterBusState {
+  volumeDb: number;
+  eqLow: number;
+  eqMid: number;
+  eqHigh: number;
+  compEnabled: boolean;
+  compThreshold: number;
+  compRatio: number;
+  limiterCeiling: number;
 }
 
 export class MultitrackEngine {
@@ -46,13 +49,25 @@ export class MultitrackEngine {
   > = new Map();
 
   private masterBus: GainNode | null = null;
-  private masterVolumeDb = 0;
+  private masterEqLowNode: BiquadFilterNode | null = null;
+  private masterEqMidNode: BiquadFilterNode | null = null;
+  private masterEqHighNode: BiquadFilterNode | null = null;
+  private masterCompNode: DynamicsCompressorNode | null = null;
+
+  private masterState: MasterBusState = {
+    volumeDb: 0,
+    eqLow: 0,
+    eqMid: 0,
+    eqHigh: 0,
+    compEnabled: true,
+    compThreshold: -14,
+    compRatio: 2.5,
+    limiterCeiling: -0.3,
+  };
+
   private isPlaying = false;
   private startTime = 0;
   private pauseOffset = 0;
-  private isLooping = false;
-  private loopStart = 0;
-  private loopEnd = 12.0;
 
   constructor() {}
 
@@ -71,7 +86,6 @@ export class MultitrackEngine {
 
   public setTracks(tracks: TrackData[]) {
     this.tracks = tracks;
-    // Pre-calculate waveforms if missing
     this.tracks.forEach((track) => {
       if (!track.waveformData) {
         track.waveformData = this.generateWaveformPeaks(track.buffer, 120);
@@ -88,6 +102,15 @@ export class MultitrackEngine {
       track.waveformData = this.generateWaveformPeaks(track.buffer, 120);
     }
     this.tracks.push(track);
+  }
+
+  public addTracks(newTracks: TrackData[]) {
+    newTracks.forEach((t) => {
+      if (!t.waveformData) {
+        t.waveformData = this.generateWaveformPeaks(t.buffer, 120);
+      }
+      this.tracks.push(t);
+    });
   }
 
   public removeTrack(trackId: string) {
@@ -107,30 +130,49 @@ export class MultitrackEngine {
         this.updateTrackGain(track, nodes.gainNode, now);
       }
       if (updates.pan !== undefined) {
-        nodes.panNode.pan.setTargetAtTime(track.pan, now, 0.02);
+        nodes.panNode.pan.setValueAtTime(track.pan, now);
       }
       if (updates.eqLow !== undefined) {
-        nodes.eqLow.gain.setTargetAtTime(track.eqLow, now, 0.02);
+        nodes.eqLow.gain.setValueAtTime(track.eqLow, now);
       }
       if (updates.eqMid !== undefined) {
-        nodes.eqMid.gain.setTargetAtTime(track.eqMid, now, 0.02);
+        nodes.eqMid.gain.setValueAtTime(track.eqMid, now);
       }
       if (updates.eqHigh !== undefined) {
-        nodes.eqHigh.gain.setTargetAtTime(track.eqHigh, now, 0.02);
+        nodes.eqHigh.gain.setValueAtTime(track.eqHigh, now);
+      }
+    }
+  }
+
+  public getMasterState(): MasterBusState {
+    return this.masterState;
+  }
+
+  public updateMasterState(updates: Partial<MasterBusState>) {
+    this.masterState = { ...this.masterState, ...updates };
+    if (this.ctx) {
+      const now = this.ctx.currentTime;
+      if (this.masterBus && updates.volumeDb !== undefined) {
+        this.masterBus.gain.setValueAtTime(Math.pow(10, updates.volumeDb / 20), now);
+      }
+      if (this.masterEqLowNode && updates.eqLow !== undefined) {
+        this.masterEqLowNode.gain.setValueAtTime(updates.eqLow, now);
+      }
+      if (this.masterEqMidNode && updates.eqMid !== undefined) {
+        this.masterEqMidNode.gain.setValueAtTime(updates.eqMid, now);
+      }
+      if (this.masterEqHighNode && updates.eqHigh !== undefined) {
+        this.masterEqHighNode.gain.setValueAtTime(updates.eqHigh, now);
       }
     }
   }
 
   public setMasterVolume(db: number) {
-    this.masterVolumeDb = db;
-    if (this.masterBus && this.ctx) {
-      const lin = Math.pow(10, db / 20);
-      this.masterBus.gain.setTargetAtTime(lin, this.ctx.currentTime, 0.02);
-    }
+    this.updateMasterState({ volumeDb: db });
   }
 
   public getMasterVolume(): number {
-    return this.masterVolumeDb;
+    return this.masterState.volumeDb;
   }
 
   public getMaxDuration(): number {
@@ -160,10 +202,40 @@ export class MultitrackEngine {
     const now = ctx.currentTime;
     this.startTime = now - offset;
 
-    // Master bus
+    // Build Master Bus Channel
     this.masterBus = ctx.createGain();
-    this.masterBus.gain.value = Math.pow(10, this.masterVolumeDb / 20);
-    this.masterBus.connect(ctx.destination);
+    this.masterBus.gain.setValueAtTime(Math.pow(10, this.masterState.volumeDb / 20), now);
+
+    this.masterEqLowNode = ctx.createBiquadFilter();
+    this.masterEqLowNode.type = 'lowshelf';
+    this.masterEqLowNode.frequency.setValueAtTime(100, now);
+    this.masterEqLowNode.gain.setValueAtTime(this.masterState.eqLow, now);
+
+    this.masterEqMidNode = ctx.createBiquadFilter();
+    this.masterEqMidNode.type = 'peaking';
+    this.masterEqMidNode.frequency.setValueAtTime(1200, now);
+    this.masterEqMidNode.gain.setValueAtTime(this.masterState.eqMid, now);
+
+    this.masterEqHighNode = ctx.createBiquadFilter();
+    this.masterEqHighNode.type = 'highshelf';
+    this.masterEqHighNode.frequency.setValueAtTime(8000, now);
+    this.masterEqHighNode.gain.setValueAtTime(this.masterState.eqHigh, now);
+
+    this.masterCompNode = ctx.createDynamicsCompressor();
+    this.masterCompNode.threshold.setValueAtTime(this.masterState.compThreshold, now);
+    this.masterCompNode.ratio.setValueAtTime(this.masterState.compRatio, now);
+
+    // Master Limiter Waveshaper
+    const masterLimiter = ctx.createWaveShaper();
+    masterLimiter.curve = this.createLimiterCurve(this.masterState.limiterCeiling) as any;
+
+    // Chain: MasterBus -> EqLow -> EqMid -> EqHigh -> Comp -> Limiter -> Destination
+    this.masterBus.connect(this.masterEqLowNode);
+    this.masterEqLowNode.connect(this.masterEqMidNode);
+    this.masterEqMidNode.connect(this.masterEqHighNode);
+    this.masterEqHighNode.connect(this.masterCompNode);
+    this.masterCompNode.connect(masterLimiter);
+    masterLimiter.connect(ctx.destination);
 
     // Any track soloed?
     const anySolo = this.tracks.some((t) => t.solo);
@@ -175,28 +247,28 @@ export class MultitrackEngine {
       // Track channel strip
       const eqLow = ctx.createBiquadFilter();
       eqLow.type = 'lowshelf';
-      eqLow.frequency.value = 200;
-      eqLow.gain.value = track.eqLow;
+      eqLow.frequency.setValueAtTime(200, now);
+      eqLow.gain.setValueAtTime(track.eqLow, now);
 
       const eqMid = ctx.createBiquadFilter();
       eqMid.type = 'peaking';
-      eqMid.frequency.value = 1200;
-      eqMid.gain.value = track.eqMid;
-      eqMid.Q.value = 1.0;
+      eqMid.frequency.setValueAtTime(1200, now);
+      eqMid.gain.setValueAtTime(track.eqMid, now);
+      eqMid.Q.setValueAtTime(1.0, now);
 
       const eqHigh = ctx.createBiquadFilter();
       eqHigh.type = 'highshelf';
-      eqHigh.frequency.value = 6000;
-      eqHigh.gain.value = track.eqHigh;
+      eqHigh.frequency.setValueAtTime(6000, now);
+      eqHigh.gain.setValueAtTime(track.eqHigh, now);
 
       const panNode = ctx.createStereoPanner();
-      panNode.pan.value = track.pan;
+      panNode.pan.setValueAtTime(track.pan, now);
 
       const gainNode = ctx.createGain();
       const isAudible = !track.mute && (!anySolo || track.solo);
-      gainNode.gain.value = isAudible ? Math.pow(10, track.volumeDb / 20) : 0;
+      gainNode.gain.setValueAtTime(isAudible ? Math.pow(10, track.volumeDb / 20) : 0, now);
 
-      // Chain: Source -> Low -> Mid -> High -> Pan -> Gain -> Master Bus
+      // Track Chain: Source -> Low -> Mid -> High -> Pan -> Gain -> Master Bus
       source.connect(eqLow);
       eqLow.connect(eqMid);
       eqMid.connect(eqHigh);
@@ -252,12 +324,34 @@ export class MultitrackEngine {
     const anySolo = this.tracks.some((t) => t.solo);
     const isAudible = !track.mute && (!anySolo || track.solo);
     const lin = isAudible ? Math.pow(10, track.volumeDb / 20) : 0;
-    gainNode.gain.setTargetAtTime(lin, now, 0.02);
+    gainNode.gain.setValueAtTime(lin, now);
+  }
+
+  private createLimiterCurve(ceilingDb: number): Float32Array {
+    const samples = 4096;
+    const curve = new Float32Array(samples);
+    const ceilingLin = Math.pow(10, ceilingDb / 20);
+
+    for (let i = 0; i < samples; i++) {
+      const x = (i * 2) / samples - 1;
+      const absX = Math.abs(x);
+      const knee = 0.8 * ceilingLin;
+      if (absX <= knee) {
+        curve[i] = x;
+      } else {
+        const excess = absX - knee;
+        const comp = Math.tanh(excess / (ceilingLin - knee)) * (ceilingLin - knee);
+        curve[i] = Math.sign(x) * (knee + comp);
+      }
+    }
+    return curve;
   }
 
   /**
    * Offline Mixdown Rendering:
-   * Renders the complete multitrack mix into a pristine 32-bit float stereo AudioBuffer.
+   * Renders the complete multitrack mix (all active tracks, track EQ, pan, volume)
+   * plus the Master Bus Channel strip (Master EQ, Compressor, Limiter, Master Gain)
+   * into a pristine 32-bit float stereo AudioBuffer.
    */
   public async renderMixOffline(): Promise<AudioBuffer> {
     if (this.tracks.length === 0) {
@@ -269,9 +363,40 @@ export class MultitrackEngine {
     const length = Math.ceil(duration * sampleRate);
 
     const offlineCtx = new OfflineAudioContext(2, length, sampleRate);
+
+    // Build Master Bus
     const masterBus = offlineCtx.createGain();
-    masterBus.gain.value = Math.pow(10, this.masterVolumeDb / 20);
-    masterBus.connect(offlineCtx.destination);
+    masterBus.gain.setValueAtTime(Math.pow(10, this.masterState.volumeDb / 20), 0);
+
+    const masterEqLow = offlineCtx.createBiquadFilter();
+    masterEqLow.type = 'lowshelf';
+    masterEqLow.frequency.setValueAtTime(100, 0);
+    masterEqLow.gain.setValueAtTime(this.masterState.eqLow, 0);
+
+    const masterEqMid = offlineCtx.createBiquadFilter();
+    masterEqMid.type = 'peaking';
+    masterEqMid.frequency.setValueAtTime(1200, 0);
+    masterEqMid.gain.setValueAtTime(this.masterState.eqMid, 0);
+
+    const masterEqHigh = offlineCtx.createBiquadFilter();
+    masterEqHigh.type = 'highshelf';
+    masterEqHigh.frequency.setValueAtTime(8000, 0);
+    masterEqHigh.gain.setValueAtTime(this.masterState.eqHigh, 0);
+
+    const masterComp = offlineCtx.createDynamicsCompressor();
+    masterComp.threshold.setValueAtTime(this.masterState.compThreshold, 0);
+    masterComp.ratio.setValueAtTime(this.masterState.compRatio, 0);
+
+    const masterLimiter = offlineCtx.createWaveShaper();
+    masterLimiter.curve = this.createLimiterCurve(this.masterState.limiterCeiling) as any;
+
+    // Master Chain: Bus -> Low -> Mid -> High -> Comp -> Limiter -> Destination
+    masterBus.connect(masterEqLow);
+    masterEqLow.connect(masterEqMid);
+    masterEqMid.connect(masterEqHigh);
+    masterEqHigh.connect(masterComp);
+    masterComp.connect(masterLimiter);
+    masterLimiter.connect(offlineCtx.destination);
 
     const anySolo = this.tracks.some((t) => t.solo);
 
@@ -284,25 +409,25 @@ export class MultitrackEngine {
 
       const eqLow = offlineCtx.createBiquadFilter();
       eqLow.type = 'lowshelf';
-      eqLow.frequency.value = 200;
-      eqLow.gain.value = track.eqLow;
+      eqLow.frequency.setValueAtTime(200, 0);
+      eqLow.gain.setValueAtTime(track.eqLow, 0);
 
       const eqMid = offlineCtx.createBiquadFilter();
       eqMid.type = 'peaking';
-      eqMid.frequency.value = 1200;
-      eqMid.gain.value = track.eqMid;
-      eqMid.Q.value = 1.0;
+      eqMid.frequency.setValueAtTime(1200, 0);
+      eqMid.gain.setValueAtTime(track.eqMid, 0);
+      eqMid.Q.setValueAtTime(1.0, 0);
 
       const eqHigh = offlineCtx.createBiquadFilter();
       eqHigh.type = 'highshelf';
-      eqHigh.frequency.value = 6000;
-      eqHigh.gain.value = track.eqHigh;
+      eqHigh.frequency.setValueAtTime(6000, 0);
+      eqHigh.gain.setValueAtTime(track.eqHigh, 0);
 
       const panNode = offlineCtx.createStereoPanner();
-      panNode.pan.value = track.pan;
+      panNode.pan.setValueAtTime(track.pan, 0);
 
       const gainNode = offlineCtx.createGain();
-      gainNode.gain.value = Math.pow(10, track.volumeDb / 20);
+      gainNode.gain.setValueAtTime(Math.pow(10, track.volumeDb / 20), 0);
 
       source.connect(eqLow);
       eqLow.connect(eqMid);

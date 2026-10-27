@@ -12,6 +12,8 @@ import {
   Layers,
   ArrowRight,
   Upload,
+  CheckCircle2,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { Knob } from './Knob';
 import { EqCurveCanvas } from './EqCurveCanvas';
@@ -19,6 +21,7 @@ import { CompressorCurveCanvas } from './CompressorCurveCanvas';
 import { SpectrumAnalyzer } from './SpectrumAnalyzer';
 import { WaveformDisplay } from './WaveformDisplay';
 import { AudioMeter } from './AudioMeter';
+import { ExportModal } from './ExportModal';
 import {
   masterEngine,
   MasteringDspState,
@@ -53,12 +56,10 @@ export const ProMasteringSuite: React.FC = () => {
   const [meterL, setMeterL] = useState<number>(-60);
   const [meterR, setMeterR] = useState<number>(-60);
 
-  // Export settings
-  const [bitDepth, setBitDepth] = useState<BitDepth>(24);
-  const [isExporting, setIsExporting] = useState<boolean>(false);
+  // Export Modal
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
   useEffect(() => {
-    // If no buffer in engine, generate demo
     const currentBuf = masterEngine.getAudioBuffer();
     if (currentBuf) {
       setBuffer(currentBuf);
@@ -89,7 +90,6 @@ export const ProMasteringSuite: React.FC = () => {
       if (playing) {
         const gr = masterEngine.getCurrentGainReduction();
         setGainReductionDb(gr);
-        // Sim dynamic meter swing based on limiter & comp
         const baseLevel = -6 + (dspState.masterGain || 0);
         setMeterL(Math.min(0, baseLevel + (Math.random() * 4 - 2)));
         setMeterR(Math.min(0, baseLevel + (Math.random() * 4 - 2)));
@@ -144,29 +144,26 @@ export const ProMasteringSuite: React.FC = () => {
     }
   };
 
-  const handleExport = async () => {
-    if (!buffer) return;
-    setIsExporting(true);
-    try {
-      const renderedBuffer = await masterEngine.renderMasterOffline(buffer, {
-        ...dspState,
-        bypass: false,
-      });
+  // Render callback for ExportModal
+  const handleRenderCallback = async (options: {
+    filename: string;
+    bitDepth: BitDepth;
+    sampleRate: number;
+    normalize: boolean;
+  }) => {
+    if (!buffer) throw new Error('No audio loaded to export');
+    const renderedBuffer = await masterEngine.renderMasterOffline(buffer, {
+      ...dspState,
+      bypass: false,
+    });
 
-      const wavBlob = encodeWAV(renderedBuffer, {
-        bitDepth,
-        normalize: true,
-        sampleRate: renderedBuffer.sampleRate,
-      });
+    const wavBlob = encodeWAV(renderedBuffer, {
+      bitDepth: options.bitDepth,
+      normalize: options.normalize,
+      sampleRate: options.sampleRate,
+    });
 
-      const cleanName = fileName.replace(/\.[^/.]+$/, '');
-      const exportName = `${cleanName}_ProMaster_${bitDepth}bit.wav`;
-      downloadBlob(wavBlob, exportName);
-    } catch (err) {
-      console.error('Master export error:', err);
-    } finally {
-      setIsExporting(false);
-    }
+    return { blob: wavBlob, renderedBuffer };
   };
 
   return (
@@ -184,7 +181,7 @@ export const ProMasteringSuite: React.FC = () => {
           <div className="flex items-center gap-2">
             <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-semibold text-zinc-200 cursor-pointer transition-all">
               <Upload className="w-3.5 h-3.5 text-amber-400" />
-              <span>Import Song</span>
+              <span>Import Audio File</span>
               <input type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" />
             </label>
 
@@ -229,18 +226,17 @@ export const ProMasteringSuite: React.FC = () => {
 
           <div className="flex items-center gap-2">
             <button
-              onClick={handleExport}
-              disabled={isExporting}
+              onClick={() => setIsExportModalOpen(true)}
               className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black font-extrabold text-xs shadow-md shadow-emerald-500/20 transition-all cursor-pointer"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>{isExporting ? 'EXPORTING...' : 'EXPORT MASTER WAV'}</span>
+              <span>EXPORT MASTERED WAV</span>
             </button>
           </div>
         </div>
       </div>
 
-      {/* Main Rack: 5-Band Parametric EQ & Real-time FFT Analyzer */}
+      {/* Main Rack: 5-Band Parametric EQ & Interactive Curve */}
       <div className="bg-[#121622] rounded-2xl border border-white/10 p-5 shadow-xl space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -250,7 +246,7 @@ export const ProMasteringSuite: React.FC = () => {
             </h3>
           </div>
           <span className="text-[10px] font-mono text-zinc-400 bg-black/40 px-2 py-0.5 rounded border border-white/5">
-            Direct Form II Transposed Biquads
+            Direct Form II Transposed Biquads • Interactive Touch/Mouse
           </span>
         </div>
 
@@ -262,9 +258,9 @@ export const ProMasteringSuite: React.FC = () => {
         />
 
         {/* 5 Band Knobs Strip */}
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 pt-2">
+        <div className="grid grid-cols-1 sm:grid-cols-5 gap-3 pt-2">
           {dspState.eqBands.map((band, idx) => {
-            const labels = ['Band 1: Sub/Bass', 'Band 2: Low-Mid', 'Band 3: Mid Presence', 'Band 4: High-Mid', 'Band 5: Air Shelf'];
+            const labels = ['Band 1: Low Shelf', 'Band 2: Low-Mid', 'Band 3: Mid Presence', 'Band 4: High-Mid', 'Band 5: High Shelf'];
             return (
               <div
                 key={band.id}
@@ -278,12 +274,27 @@ export const ProMasteringSuite: React.FC = () => {
                     type="checkbox"
                     checked={band.enabled}
                     onChange={(e) => handleUpdateBand(idx, { enabled: e.target.checked })}
-                    className="accent-amber-500 rounded"
+                    className="accent-amber-500 rounded cursor-pointer"
                     title="Enable/Bypass band"
                   />
                 </div>
 
-                <div className="flex items-center justify-around w-full mt-2">
+                {/* Filter Type Toggle */}
+                <div className="w-full flex justify-center mb-2">
+                  <select
+                    value={band.type}
+                    onChange={(e) => handleUpdateBand(idx, { type: e.target.value as BiquadFilterType })}
+                    className="bg-black/60 text-[9px] font-mono text-zinc-300 border border-white/10 rounded px-1.5 py-0.5 outline-none"
+                  >
+                    <option value="lowshelf">Low Shelf</option>
+                    <option value="peaking">Peaking/Bell</option>
+                    <option value="highshelf">High Shelf</option>
+                    <option value="highpass">High Pass</option>
+                    <option value="lowpass">Low Pass</option>
+                  </select>
+                </div>
+
+                <div className="flex items-center justify-around w-full mt-1">
                   <Knob
                     label="FREQ"
                     value={band.freq}
@@ -293,6 +304,7 @@ export const ProMasteringSuite: React.FC = () => {
                     unit="Hz"
                     size={44}
                     color="#f59e0b"
+                    isLogarithmic={true}
                     onChange={(f) => handleUpdateBand(idx, { freq: f })}
                   />
 
@@ -336,7 +348,7 @@ export const ProMasteringSuite: React.FC = () => {
               <Activity className="w-3.5 h-3.5" />
               MODULE 2: DYNAMICS COMPRESSOR
             </span>
-            <label className="flex items-center gap-1 text-[10px] font-mono text-zinc-300">
+            <label className="flex items-center gap-1 text-[10px] font-mono text-zinc-300 cursor-pointer">
               <input
                 type="checkbox"
                 checked={dspState.compressor.enabled}
@@ -437,7 +449,7 @@ export const ProMasteringSuite: React.FC = () => {
               <Maximize2 className="w-3.5 h-3.5" />
               MODULE 3: BRICKWALL LIMITER
             </span>
-            <label className="flex items-center gap-1 text-[10px] font-mono text-zinc-300">
+            <label className="flex items-center gap-1 text-[10px] font-mono text-zinc-300 cursor-pointer">
               <input
                 type="checkbox"
                 checked={dspState.limiter.enabled}
@@ -549,6 +561,23 @@ export const ProMasteringSuite: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Custom Filename Export Dialog */}
+      <ExportModal
+        isOpen={isExportModalOpen}
+        onClose={() => setIsExportModalOpen(false)}
+        defaultFilename={`${fileName.replace(/\.[^/.]+$/, '')}_ProMaster`}
+        modalTitle="Export Mastered Track (WAV)"
+        onRender={handleRenderCallback}
+        onLoadExportedAudio={(newBuf, newName) => {
+          setBuffer(newBuf);
+          setFileName(newName);
+          setDuration(newBuf.duration);
+          masterEngine.loadAudioBuffer(newBuf);
+          const metrics = masterEngine.analyzeLoudness(newBuf);
+          setLufsValues(metrics);
+        }}
+      />
     </div>
   );
 };

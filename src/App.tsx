@@ -86,7 +86,10 @@ export default function App() {
       {/* Main Workstation View Area */}
       <main className="flex-1 pb-12">
         {currentMode === 'easy' && (
-          <EasyMasteringView onSwitchToPro={() => setCurrentMode('pro')} />
+          <EasyMasteringView
+            onSwitchToPro={() => setCurrentMode('pro')}
+            onSwitchToMultitrack={() => setCurrentMode('multitrack')}
+          />
         )}
 
         {currentMode === 'pro' && <ProMasteringSuite />}

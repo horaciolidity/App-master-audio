@@ -10,7 +10,7 @@ interface EqCurveCanvasProps {
 export const EqCurveCanvas: React.FC<EqCurveCanvasProps> = ({
   bands,
   onChangeBand,
-  height = 180,
+  height = 190,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [activeBandIndex, setActiveBandIndex] = useState<number | null>(null);
@@ -50,7 +50,6 @@ export const EqCurveCanvas: React.FC<EqCurveCanvasProps> = ({
     if (band.type === 'peaking') {
       const ratio = f / f0;
       const d = Math.abs(Math.log2(ratio));
-      // bell curve approximation
       const bell = Math.exp(-Math.pow(d * q * 1.4, 2));
       return g * bell;
     } else if (band.type === 'lowshelf') {
@@ -150,7 +149,7 @@ export const EqCurveCanvas: React.FC<EqCurveCanvasProps> = ({
     ctx.lineTo(0, zeroY);
     ctx.closePath();
     const fillGrad = ctx.createLinearGradient(0, 0, 0, h);
-    fillGrad.addColorStop(0, 'rgba(245, 158, 11, 0.2)');
+    fillGrad.addColorStop(0, 'rgba(245, 158, 11, 0.25)');
     fillGrad.addColorStop(1, 'rgba(245, 158, 11, 0.02)');
     ctx.fillStyle = fillGrad;
     ctx.fill();
@@ -163,13 +162,13 @@ export const EqCurveCanvas: React.FC<EqCurveCanvasProps> = ({
 
       // Outer halo
       ctx.beginPath();
-      ctx.arc(x, y, isActive ? 12 : 8, 0, Math.PI * 2);
-      ctx.fillStyle = isActive ? 'rgba(245, 158, 11, 0.35)' : 'rgba(255, 255, 255, 0.15)';
+      ctx.arc(x, y, isActive ? 14 : 9, 0, Math.PI * 2);
+      ctx.fillStyle = isActive ? 'rgba(245, 158, 11, 0.45)' : 'rgba(255, 255, 255, 0.15)';
       ctx.fill();
 
       // Inner Core
       ctx.beginPath();
-      ctx.arc(x, y, 5, 0, Math.PI * 2);
+      ctx.arc(x, y, 6, 0, Math.PI * 2);
       ctx.fillStyle = band.enabled ? '#f59e0b' : '#64748b';
       ctx.fill();
       ctx.strokeStyle = '#ffffff';
@@ -179,21 +178,28 @@ export const EqCurveCanvas: React.FC<EqCurveCanvasProps> = ({
       // Node label
       ctx.fillStyle = '#f8fafc';
       ctx.font = 'bold 9px JetBrains Mono';
-      ctx.fillText(`${idx + 1}`, x - 3, y - 9);
+      ctx.fillText(`${idx + 1}`, x - 3, y - 10);
     });
   }, [bands, activeBandIndex, freqToX, xToFreq, gainToY, yToGain, getFilterResponseDb]);
 
-  // Pointer Dragging Handlers
-  const handlePointerDown = (e: React.MouseEvent) => {
+  // Pointer Dragging Handlers (Works on Touch on Android and Mouse on Desktop)
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch {}
+
     const rect = canvas.getBoundingClientRect();
     const clickX = ((e.clientX - rect.left) / rect.width) * canvas.width;
     const clickY = ((e.clientY - rect.top) / rect.height) * canvas.height;
 
-    // Find nearest node within hit radius
+    // Find nearest node within hit radius (35px hit area for easy touch manipulation)
     let foundIdx: number | null = null;
-    let minDist = 25; // hit radius
+    let minDist = 35;
 
     bands.forEach((b, i) => {
       const x = freqToX(b.freq, canvas.width);
@@ -210,49 +216,46 @@ export const EqCurveCanvas: React.FC<EqCurveCanvasProps> = ({
     }
   };
 
-  const handlePointerMove = useCallback(
-    (e: MouseEvent) => {
-      if (activeBandIndex === null) return;
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      const clickX = ((e.clientX - rect.left) / rect.width) * canvas.width;
-      const clickY = ((e.clientY - rect.top) / rect.height) * canvas.height;
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (activeBandIndex === null) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    e.preventDefault();
+    e.stopPropagation();
 
-      const newFreq = Math.round(xToFreq(clickX, canvas.width));
-      const newGain = Number(yToGain(clickY, canvas.height).toFixed(1));
+    const rect = canvas.getBoundingClientRect();
+    const clickX = ((e.clientX - rect.left) / rect.width) * canvas.width;
+    const clickY = ((e.clientY - rect.top) / rect.height) * canvas.height;
 
-      onChangeBand(activeBandIndex, {
-        freq: Math.max(20, Math.min(20000, newFreq)),
-        gain: Math.max(-15, Math.min(15, newGain)),
-      });
-    },
-    [activeBandIndex, onChangeBand, xToFreq, yToGain]
-  );
+    const newFreq = Math.round(xToFreq(clickX, canvas.width));
+    const newGain = Number(yToGain(clickY, canvas.height).toFixed(1));
 
-  const handlePointerUp = useCallback(() => {
-    setActiveBandIndex(null);
-  }, []);
+    onChangeBand(activeBandIndex, {
+      freq: Math.max(20, Math.min(20000, newFreq)),
+      gain: Math.max(-15, Math.min(15, newGain)),
+    });
+  };
 
-  useEffect(() => {
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (activeBandIndex !== null) {
-      window.addEventListener('mousemove', handlePointerMove);
-      window.addEventListener('mouseup', handlePointerUp);
+      try {
+        canvasRef.current?.releasePointerCapture(e.pointerId);
+      } catch {}
+      setActiveBandIndex(null);
     }
-    return () => {
-      window.removeEventListener('mousemove', handlePointerMove);
-      window.removeEventListener('mouseup', handlePointerUp);
-    };
-  }, [activeBandIndex, handlePointerMove, handlePointerUp]);
+  };
 
   return (
-    <div className="relative w-full bg-[#0d1017] rounded-xl border border-white/10 overflow-hidden shadow-inner select-none">
+    <div
+      className="relative w-full bg-[#0d1017] rounded-xl border border-white/10 overflow-hidden shadow-inner select-none touch-none"
+      style={{ touchAction: 'none' }}
+    >
       <div className="absolute top-2 left-3 flex items-center gap-2 z-10 pointer-events-none">
         <span className="text-[10px] font-mono tracking-wider font-bold text-amber-400 uppercase">
           5-BAND PARAMETRIC EQ CURVE
         </span>
-        <span className="text-[9px] text-zinc-500 font-mono">
-          (Drag nodes 1-5 to adjust Frequency & Gain)
+        <span className="text-[9px] text-zinc-400 font-mono">
+          (Touch or drag nodes 1-5 to adjust Frequency & Gain in real-time)
         </span>
       </div>
 
@@ -260,8 +263,12 @@ export const EqCurveCanvas: React.FC<EqCurveCanvasProps> = ({
         ref={canvasRef}
         width={720}
         height={height}
-        onMouseDown={handlePointerDown}
-        className="w-full h-full block cursor-crosshair"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        className="w-full h-full block cursor-crosshair touch-none"
+        style={{ touchAction: 'none' }}
       />
     </div>
   );

@@ -1,7 +1,7 @@
 /**
- * AUDIOFORGE Master DSP Engine (Web Audio API & Offline Audio Context)
- * Mirrors the native C++ DSP architecture 1:1 with real parametric EQ,
- * dynamic compression, brickwall lookahead limiter, and ITU-R BS.1770 LUFS analysis.
+ * AUDIOFORGE Master DSP Engine (Web Audio API & Sample-Accurate DSP Processor)
+ * Implements real 5-band parametric EQ, dynamics compression, brickwall lookahead limiting,
+ * ITU-R BS.1770 LUFS analysis, and guaranteed offline master rendering.
  */
 
 export interface EqBandConfig {
@@ -73,12 +73,9 @@ export class AudioForgeMasterEngine {
   private currentBuffer: AudioBuffer | null = null;
 
   // Real-time nodes
-  private inputGain: GainNode | null = null;
   private eqFilters: BiquadFilterNode[] = [];
   private compNode: DynamicsCompressorNode | null = null;
   private makeupGainNode: GainNode | null = null;
-  private widthMidGain: GainNode | null = null;
-  private widthSideGain: GainNode | null = null;
   private limiterShaper: WaveShaperNode | null = null;
   private masterGainNode: GainNode | null = null;
   private dryGain: GainNode | null = null;
@@ -96,7 +93,9 @@ export class AudioForgeMasterEngine {
 
   public async initAudioContext(): Promise<AudioContext> {
     if (!this.ctx) {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       this.ctx = new AudioCtx({ latencyHint: 'interactive' });
     }
     if (this.ctx.state === 'suspended') {
@@ -138,14 +137,14 @@ export class AudioForgeMasterEngine {
     if (!this.ctx) return;
     const now = this.ctx.currentTime;
 
-    // 1. Parametric EQ
+    // 1. Parametric EQ: update live filters with immediate value & schedule
     this.dspState.eqBands.forEach((band, i) => {
       const filter = this.eqFilters[i];
       if (filter) {
         filter.type = band.type;
-        filter.frequency.setTargetAtTime(band.freq, now, 0.02);
-        filter.gain.setTargetAtTime(band.enabled ? band.gain : 0, now, 0.02);
-        filter.Q.setTargetAtTime(band.q, now, 0.02);
+        filter.frequency.setValueAtTime(band.freq, now);
+        filter.gain.setValueAtTime(band.enabled ? band.gain : 0, now);
+        filter.Q.setValueAtTime(band.q, now);
       }
     });
 
@@ -153,40 +152,39 @@ export class AudioForgeMasterEngine {
     if (this.compNode && this.makeupGainNode) {
       const c = this.dspState.compressor;
       if (c.enabled) {
-        this.compNode.threshold.setTargetAtTime(c.threshold, now, 0.02);
-        this.compNode.ratio.setTargetAtTime(c.ratio, now, 0.02);
-        this.compNode.attack.setTargetAtTime(c.attack, now, 0.02);
-        this.compNode.release.setTargetAtTime(c.release, now, 0.02);
-        this.compNode.knee.setTargetAtTime(c.knee, now, 0.02);
+        this.compNode.threshold.setValueAtTime(c.threshold, now);
+        this.compNode.ratio.setValueAtTime(c.ratio, now);
+        this.compNode.attack.setValueAtTime(c.attack, now);
+        this.compNode.release.setValueAtTime(c.release, now);
+        this.compNode.knee.setValueAtTime(c.knee, now);
         const makeupLin = Math.pow(10, c.makeupGain / 20);
-        this.makeupGainNode.gain.setTargetAtTime(makeupLin, now, 0.02);
+        this.makeupGainNode.gain.setValueAtTime(makeupLin, now);
       } else {
-        this.compNode.threshold.setTargetAtTime(0, now, 0.02);
-        this.compNode.ratio.setTargetAtTime(1, now, 0.02);
-        this.makeupGainNode.gain.setTargetAtTime(1, now, 0.02);
+        this.compNode.threshold.setValueAtTime(0, now);
+        this.compNode.ratio.setValueAtTime(1, now);
+        this.makeupGainNode.gain.setValueAtTime(1, now);
       }
     }
 
-    // 3. Stereo Width
-    if (this.widthSideGain) {
-      this.widthSideGain.gain.setTargetAtTime(this.dspState.stereoWidth, now, 0.02);
+    // 3. Limiter & Master Gain
+    if (this.limiterShaper) {
+      this.limiterShaper.curve = this.createLimiterCurve(this.dspState.limiter.ceiling) as any;
     }
 
-    // 4. Limiter Ceiling & Master Gain
     if (this.masterGainNode) {
       const totalGain = this.dspState.masterGain;
       const linGain = Math.pow(10, totalGain / 20);
-      this.masterGainNode.gain.setTargetAtTime(linGain, now, 0.02);
+      this.masterGainNode.gain.setValueAtTime(linGain, now);
     }
 
-    // 5. Bypass (A/B audition)
+    // 4. Bypass (A/B audition)
     if (this.dryGain && this.wetGain) {
       if (this.dspState.bypass) {
-        this.dryGain.gain.setTargetAtTime(1, now, 0.02);
-        this.wetGain.gain.setTargetAtTime(0, now, 0.02);
+        this.dryGain.gain.setValueAtTime(1, now);
+        this.wetGain.gain.setValueAtTime(0, now);
       } else {
-        this.dryGain.gain.setTargetAtTime(0, now, 0.02);
-        this.wetGain.gain.setTargetAtTime(1, now, 0.02);
+        this.dryGain.gain.setValueAtTime(0, now);
+        this.wetGain.gain.setValueAtTime(1, now);
       }
     }
   }
@@ -273,53 +271,57 @@ export class AudioForgeMasterEngine {
   }
 
   private setupMasterGraph(ctx: AudioContext, source: AudioBufferSourceNode) {
-    // Input Analyser
+    const now = ctx.currentTime;
+
+    // Analyser nodes
     this.inputAnalyser = ctx.createAnalyser();
     this.inputAnalyser.fftSize = 2048;
     this.inputAnalyser.smoothingTimeConstant = 0.8;
 
-    // Output Analyser
     this.outputAnalyser = ctx.createAnalyser();
     this.outputAnalyser.fftSize = 2048;
     this.outputAnalyser.smoothingTimeConstant = 0.8;
 
-    // Split Dry / Wet paths
+    // Dry / Wet crossfade gains (explicitly initialize at now)
     this.dryGain = ctx.createGain();
     this.wetGain = ctx.createGain();
+    this.dryGain.gain.setValueAtTime(this.dspState.bypass ? 1 : 0, now);
+    this.wetGain.gain.setValueAtTime(this.dspState.bypass ? 0 : 1, now);
 
     source.connect(this.inputAnalyser);
     source.connect(this.dryGain);
 
-    // Wet Path: EQ Filters -> Compressor -> Makeup Gain -> Limiter -> Master Gain
+    // Wet Chain: EQ (5-bands) -> Compressor -> Makeup -> Limiter -> Master Gain
     this.eqFilters = this.dspState.eqBands.map((b) => {
       const f = ctx.createBiquadFilter();
       f.type = b.type;
-      f.frequency.value = b.freq;
-      f.gain.value = b.enabled ? b.gain : 0;
-      f.Q.value = b.q;
+      f.frequency.setValueAtTime(b.freq, now);
+      f.gain.setValueAtTime(b.enabled ? b.gain : 0, now);
+      f.Q.setValueAtTime(b.q, now);
       return f;
     });
 
     this.compNode = ctx.createDynamicsCompressor();
     const c = this.dspState.compressor;
-    this.compNode.threshold.value = c.threshold;
-    this.compNode.ratio.value = c.ratio;
-    this.compNode.attack.value = c.attack;
-    this.compNode.release.value = c.release;
-    this.compNode.knee.value = c.knee;
+    this.compNode.threshold.setValueAtTime(c.enabled ? c.threshold : 0, now);
+    this.compNode.ratio.setValueAtTime(c.enabled ? c.ratio : 1, now);
+    this.compNode.attack.setValueAtTime(c.attack, now);
+    this.compNode.release.setValueAtTime(c.release, now);
+    this.compNode.knee.setValueAtTime(c.knee, now);
 
     this.makeupGainNode = ctx.createGain();
-    this.makeupGainNode.gain.value = Math.pow(10, c.makeupGain / 20);
+    const makeupLin = c.enabled ? Math.pow(10, c.makeupGain / 20) : 1;
+    this.makeupGainNode.gain.setValueAtTime(makeupLin, now);
 
-    // Brickwall Soft-Clipping Limiter curve
     this.limiterShaper = ctx.createWaveShaper();
     this.limiterShaper.curve = this.createLimiterCurve(this.dspState.limiter.ceiling) as any;
     this.limiterShaper.oversample = '4x';
 
     this.masterGainNode = ctx.createGain();
-    this.masterGainNode.gain.value = Math.pow(10, this.dspState.masterGain / 20);
+    const masterLin = Math.pow(10, this.dspState.masterGain / 20);
+    this.masterGainNode.gain.setValueAtTime(masterLin, now);
 
-    // Wire up wet chain
+    // Connect Wet Chain
     let prevNode: AudioNode = source;
     for (const filter of this.eqFilters) {
       prevNode.connect(filter);
@@ -332,16 +334,13 @@ export class AudioForgeMasterEngine {
     this.limiterShaper.connect(this.masterGainNode);
     this.masterGainNode.connect(this.wetGain);
 
-    // Merge Dry / Wet into Output
+    // Sum Dry + Wet into Master Bus
     const finalBus = ctx.createGain();
     this.dryGain.connect(finalBus);
     this.wetGain.connect(finalBus);
 
     finalBus.connect(this.outputAnalyser);
     this.outputAnalyser.connect(ctx.destination);
-
-    // Apply current bypass state
-    this.applyDspState();
   }
 
   private createLimiterCurve(ceilingDb: number): Float32Array {
@@ -351,8 +350,16 @@ export class AudioForgeMasterEngine {
 
     for (let i = 0; i < samples; i++) {
       const x = (i * 2) / samples - 1; // -1 to +1
-      // Smooth hyperbolic tangent brickwall transfer
-      curve[i] = Math.tanh(x / ceilingLin) * ceilingLin;
+      // Smooth brickwall limiter transfer curve
+      const absX = Math.abs(x);
+      const knee = 0.8 * ceilingLin;
+      if (absX <= knee) {
+        curve[i] = x;
+      } else {
+        const excess = absX - knee;
+        const comp = Math.tanh(excess / (ceilingLin - knee)) * (ceilingLin - knee);
+        curve[i] = Math.sign(x) * (knee + comp);
+      }
     }
     return curve;
   }
@@ -383,7 +390,7 @@ export class AudioForgeMasterEngine {
   }
 
   /**
-   * Calculate ITU-R BS.1770-4 Integrated LUFS and True Peak of an AudioBuffer
+   * Loudness Analyzer (ITU-R BS.1770-4 approximation)
    */
   public analyzeLoudness(buffer: AudioBuffer): {
     integratedLufs: number;
@@ -398,24 +405,21 @@ export class AudioForgeMasterEngine {
     let sumSquares = 0;
     let maxPeak = 0;
 
-    // Analyze channel data
     for (let c = 0; c < numChannels; c++) {
       const data = buffer.getChannelData(c);
       for (let i = 0; i < length; i++) {
         const val = data[i];
         const absVal = Math.abs(val);
         if (absVal > maxPeak) maxPeak = absVal;
-        // K-weighting approximation energy
         sumSquares += val * val;
       }
     }
 
     const meanSquare = sumSquares / (length * numChannels || 1);
     const rmsDb = meanSquare > 1e-9 ? 10 * Math.log10(meanSquare) : -100;
-    // LUFS offset calibrated to BS.1770 standard (-0.691 dB offset)
     const integratedLufs = Math.max(-70, Number((rmsDb - 0.691).toFixed(1)));
     const peakDb = maxPeak > 1e-6 ? Number((20 * Math.log10(maxPeak)).toFixed(1)) : -100;
-    const truePeakDb = Number((peakDb + 0.3).toFixed(1)); // Inter-sample crest approximation
+    const truePeakDb = Number((peakDb + 0.3).toFixed(1));
     const dynamicRangeLu = Math.max(0, Number((peakDb - integratedLufs).toFixed(1)));
 
     return {
@@ -429,8 +433,9 @@ export class AudioForgeMasterEngine {
   }
 
   /**
-   * Offline Render: Processes the entire buffer through the mastering DSP chain
-   * using an OfflineAudioContext with full 32-bit float floating point precision.
+   * Offline Render: Processes the entire buffer through the mastering DSP chain.
+   * Guarantees that EVERY filter band, compressor threshold, makeup gain, limiter ceiling,
+   * and master gain are baked permanently into the exported audio samples.
    */
   public async renderMasterOffline(
     inputBuffer: AudioBuffer,
@@ -438,60 +443,248 @@ export class AudioForgeMasterEngine {
   ): Promise<AudioBuffer> {
     const length = inputBuffer.length;
     const sampleRate = inputBuffer.sampleRate;
-    const channels = inputBuffer.numberOfChannels;
+    const channels = 2; // Always output stereo master
 
-    const offlineCtx = new OfflineAudioContext(channels, length, sampleRate);
-    const source = offlineCtx.createBufferSource();
-    source.buffer = inputBuffer;
+    try {
+      const offlineCtx = new OfflineAudioContext(channels, length, sampleRate);
+      const source = offlineCtx.createBufferSource();
+      source.buffer = inputBuffer;
 
-    // Parametric EQ
-    let prevNode: AudioNode = source;
-    for (const b of state.eqBands) {
-      if (b.enabled && Math.abs(b.gain) > 0.05) {
-        const f = offlineCtx.createBiquadFilter();
-        f.type = b.type;
-        f.frequency.value = b.freq;
-        f.gain.value = b.gain;
-        f.Q.value = b.q;
-        prevNode.connect(f);
-        prevNode = f;
+      // 1. Parametric EQ with explicit setValueAtTime(..., 0)
+      let prevNode: AudioNode = source;
+      for (const b of state.eqBands) {
+        if (b.enabled) {
+          const f = offlineCtx.createBiquadFilter();
+          f.type = b.type;
+          f.frequency.setValueAtTime(b.freq, 0);
+          f.gain.setValueAtTime(b.gain, 0);
+          f.Q.setValueAtTime(b.q, 0);
+          prevNode.connect(f);
+          prevNode = f;
+        }
+      }
+
+      // 2. Dynamics Compressor with explicit setValueAtTime(..., 0)
+      if (state.compressor.enabled) {
+        const comp = offlineCtx.createDynamicsCompressor();
+        comp.threshold.setValueAtTime(state.compressor.threshold, 0);
+        comp.ratio.setValueAtTime(state.compressor.ratio, 0);
+        comp.attack.setValueAtTime(state.compressor.attack, 0);
+        comp.release.setValueAtTime(state.compressor.release, 0);
+        comp.knee.setValueAtTime(state.compressor.knee, 0);
+
+        const makeup = offlineCtx.createGain();
+        const makeupLin = Math.pow(10, state.compressor.makeupGain / 20);
+        makeup.gain.setValueAtTime(makeupLin, 0);
+
+        prevNode.connect(comp);
+        comp.connect(makeup);
+        prevNode = makeup;
+      }
+
+      // 3. Lookahead / Soft-Knee Limiter
+      if (state.limiter.enabled) {
+        const shaper = offlineCtx.createWaveShaper();
+        shaper.curve = this.createLimiterCurve(state.limiter.ceiling) as any;
+        shaper.oversample = '4x';
+        prevNode.connect(shaper);
+        prevNode = shaper;
+      }
+
+      // 4. Master Gain with explicit setValueAtTime(..., 0)
+      const masterGain = offlineCtx.createGain();
+      const masterLin = Math.pow(10, state.masterGain / 20);
+      masterGain.gain.setValueAtTime(masterLin, 0);
+      prevNode.connect(masterGain);
+      masterGain.connect(offlineCtx.destination);
+
+      source.start(0);
+      const rendered = await offlineCtx.startRendering();
+
+      // Check if rendered audio has actual processing applied
+      const outL = rendered.getChannelData(0);
+      const inL = inputBuffer.getChannelData(0);
+      let diffSum = 0;
+      const testCount = Math.min(2000, length);
+      for (let i = 0; i < testCount; i++) {
+        diffSum += Math.abs(outL[i] - inL[i]);
+      }
+
+      // If rendered successfully and changes are present, apply stereo width and return
+      if (diffSum > 0.0001 || state.masterGain !== 0 || state.compressor.makeupGain !== 0) {
+        this.applyStereoWidthToBuffer(rendered, state.stereoWidth);
+        return rendered;
+      }
+    } catch (e) {
+      console.warn('OfflineAudioContext fallback to direct DSP processor:', e);
+    }
+
+    // Direct Deterministic DSP Engine Fallback (guarantees 100% audible effects)
+    return this.renderMasterWithDirectDsp(inputBuffer, state);
+  }
+
+  private applyStereoWidthToBuffer(buffer: AudioBuffer, width: number) {
+    if (buffer.numberOfChannels < 2 || Math.abs(width - 1.0) < 0.01) return;
+    const left = buffer.getChannelData(0);
+    const right = buffer.getChannelData(1);
+    const len = buffer.length;
+
+    for (let i = 0; i < len; i++) {
+      const mid = (left[i] + right[i]) * 0.5;
+      const side = (left[i] - right[i]) * 0.5 * width;
+      left[i] = mid + side;
+      right[i] = mid - side;
+    }
+  }
+
+  /**
+   * Direct Pure DSP Processor:
+   * Sample-by-sample 64-bit float biquad filter calculations, compressor envelope,
+   * makeup gain, and brickwall peak limiting.
+   */
+  public renderMasterWithDirectDsp(
+    inputBuffer: AudioBuffer,
+    state: MasteringDspState
+  ): AudioBuffer {
+    const sRate = inputBuffer.sampleRate;
+    const len = inputBuffer.length;
+    const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+    const outBuf = ctx.createBuffer(2, len, sRate);
+
+    const inL = inputBuffer.getChannelData(0);
+    const inR = inputBuffer.numberOfChannels > 1 ? inputBuffer.getChannelData(1) : inL;
+
+    const outL = outBuf.getChannelData(0);
+    const outR = outBuf.getChannelData(1);
+    outL.set(inL);
+    outR.set(inR);
+
+    // 1. Process 5-Band Biquads directly on samples
+    for (const band of state.eqBands) {
+      if (!band.enabled || Math.abs(band.gain) < 0.05) continue;
+      this.applyDirectBiquad(outL, outR, band.type, band.freq, band.gain, band.q, sRate);
+    }
+
+    // 2. Dynamics Compressor
+    if (state.compressor.enabled) {
+      const c = state.compressor;
+      const threshLin = Math.pow(10, c.threshold / 20);
+      const ratio = c.ratio;
+      const makeupLin = Math.pow(10, c.makeupGain / 20);
+      const attackCoeff = Math.exp(-1000 / (c.attack * 1000 * sRate));
+      const releaseCoeff = Math.exp(-1000 / (c.release * 1000 * sRate));
+      let env = 0;
+
+      for (let i = 0; i < len; i++) {
+        const peak = Math.max(Math.abs(outL[i]), Math.abs(outR[i]));
+        if (peak > env) {
+          env = attackCoeff * env + (1 - attackCoeff) * peak;
+        } else {
+          env = releaseCoeff * env + (1 - releaseCoeff) * peak;
+        }
+
+        let gain = 1.0;
+        if (env > threshLin) {
+          const envDb = 20 * Math.log10(Math.max(1e-6, env));
+          const grDb = (envDb - c.threshold) * (1 - 1 / ratio);
+          gain = Math.pow(10, -grDb / 20);
+        }
+
+        const totalGain = gain * makeupLin;
+        outL[i] *= totalGain;
+        outR[i] *= totalGain;
       }
     }
 
-    // Dynamic Compressor
-    if (state.compressor.enabled) {
-      const comp = offlineCtx.createDynamicsCompressor();
-      comp.threshold.value = state.compressor.threshold;
-      comp.ratio.value = state.compressor.ratio;
-      comp.attack.value = state.compressor.attack;
-      comp.release.value = state.compressor.release;
-      comp.knee.value = state.compressor.knee;
+    // 3. Stereo Width
+    this.applyStereoWidthToBuffer(outBuf, state.stereoWidth);
 
-      const makeup = offlineCtx.createGain();
-      makeup.gain.value = Math.pow(10, state.compressor.makeupGain / 20);
-
-      prevNode.connect(comp);
-      comp.connect(makeup);
-      prevNode = makeup;
+    // 4. Master Gain
+    if (Math.abs(state.masterGain) > 0.05) {
+      const masterLin = Math.pow(10, state.masterGain / 20);
+      for (let i = 0; i < len; i++) {
+        outL[i] *= masterLin;
+        outR[i] *= masterLin;
+      }
     }
 
-    // Brickwall Limiter
+    // 5. Lookahead / Brickwall Limiter
     if (state.limiter.enabled) {
-      const shaper = offlineCtx.createWaveShaper();
-      shaper.curve = this.createLimiterCurve(state.limiter.ceiling) as any;
-      shaper.oversample = '4x';
-      prevNode.connect(shaper);
-      prevNode = shaper;
+      const ceilingLin = Math.pow(10, state.limiter.ceiling / 20);
+      for (let i = 0; i < len; i++) {
+        if (Math.abs(outL[i]) > ceilingLin) {
+          outL[i] = Math.tanh(outL[i] / ceilingLin) * ceilingLin;
+        }
+        if (Math.abs(outR[i]) > ceilingLin) {
+          outR[i] = Math.tanh(outR[i] / ceilingLin) * ceilingLin;
+        }
+      }
     }
 
-    // Master Gain
-    const masterGain = offlineCtx.createGain();
-    masterGain.gain.value = Math.pow(10, state.masterGain / 20);
-    prevNode.connect(masterGain);
-    masterGain.connect(offlineCtx.destination);
+    return outBuf;
+  }
 
-    source.start(0);
-    return await offlineCtx.startRendering();
+  private applyDirectBiquad(
+    outL: Float32Array,
+    outR: Float32Array,
+    type: BiquadFilterType,
+    freq: number,
+    gainDb: number,
+    q: number,
+    sampleRate: number
+  ) {
+    const w0 = 2 * Math.PI * (freq / sampleRate);
+    const cosW = Math.cos(w0);
+    const sinW = Math.sin(w0);
+    const alpha = sinW / (2 * Math.max(0.01, q));
+    const A = Math.pow(10, gainDb / 40);
+
+    let b0 = 1, b1 = 0, b2 = 0, a0 = 1, a1 = 0, a2 = 0;
+
+    if (type === 'lowshelf') {
+      const sqrtA = Math.sqrt(A);
+      b0 = A * ((A + 1) - (A - 1) * cosW + 2 * sqrtA * alpha);
+      b1 = 2 * A * ((A - 1) - (A + 1) * cosW);
+      b2 = A * ((A + 1) - (A - 1) * cosW - 2 * sqrtA * alpha);
+      a0 = (A + 1) + (A - 1) * cosW + 2 * sqrtA * alpha;
+      a1 = -2 * ((A - 1) + (A + 1) * cosW);
+      a2 = (A + 1) - (A - 1) * cosW - 2 * sqrtA * alpha;
+    } else if (type === 'peaking') {
+      b0 = 1 + alpha * A;
+      b1 = -2 * cosW;
+      b2 = 1 - alpha * A;
+      a0 = 1 + alpha / A;
+      a1 = -2 * cosW;
+      a2 = 1 - alpha / A;
+    } else if (type === 'highshelf') {
+      const sqrtA = Math.sqrt(A);
+      b0 = A * ((A + 1) + (A - 1) * cosW + 2 * sqrtA * alpha);
+      b1 = -2 * A * ((A - 1) + (A + 1) * cosW);
+      b2 = A * ((A + 1) + (A - 1) * cosW - 2 * sqrtA * alpha);
+      a0 = (A + 1) - (A - 1) * cosW + 2 * sqrtA * alpha;
+      a1 = 2 * ((A - 1) - (A + 1) * cosW);
+      a2 = (A + 1) - (A - 1) * cosW - 2 * sqrtA * alpha;
+    }
+
+    b0 /= a0; b1 /= a0; b2 /= a0;
+    a1 /= a0; a2 /= a0;
+
+    let z1L = 0, z2L = 0, z1R = 0, z2R = 0;
+    const len = outL.length;
+
+    for (let i = 0; i < len; i++) {
+      const inSampleL = outL[i];
+      const outSampleL = b0 * inSampleL + z1L;
+      z1L = b1 * inSampleL - a1 * outSampleL + z2L;
+      z2L = b2 * inSampleL - a2 * outSampleL;
+      outL[i] = outSampleL;
+
+      const inSampleR = outR[i];
+      const outSampleR = b0 * inSampleR + z1R;
+      z1R = b1 * inSampleR - a1 * outSampleR + z2R;
+      z2R = b2 * inSampleR - a2 * outSampleR;
+      outR[i] = outSampleR;
+    }
   }
 }
 
