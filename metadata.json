@@ -1,0 +1,6 @@
+{
+  "name": "AUDIOFORGE AI STUDIO",
+  "description": "Professional cross-platform audio mixing and mastering studio with native C++ DSP engine, parametric EQ, compressor, lookahead limiter, multitrack DAW, LUFS loudness analysis, and local AI model integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

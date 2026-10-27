@@ -1,0 +1,32 @@
+name: audioforge_studio
+description: "AUDIOFORGE AI STUDIO - Cross-platform Audio Mixing and Mastering Workstation with Native C++ DSP Engine"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+  flutter: '>=3.16.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.2
+  path_provider: ^2.1.3
+  file_picker: ^8.0.0
+  flutter_sound: ^9.2.13
+  audioplayers: ^6.0.0
+  provider: ^6.1.2
+  google_fonts: ^6.2.1
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  ffigen: ^11.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/
+    - assets/presets/
